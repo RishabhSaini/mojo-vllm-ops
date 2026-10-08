@@ -1,104 +1,70 @@
-# Mojo kernels in vLLM — an integration experiment
+# mojo-vllm-ops
 
-This repo is an end-to-end evaluation of a question: **can Mojo/MAX kernels
-live inside vLLM?** It contains a Mojo port of vLLM's
-`fused_add_rms_norm` CUDA kernel, exposed to PyTorch via MAX's
-`CustomOpLibrary`, and registered into vLLM's IR-op dispatch system as a
-first-class provider (`"mojo"`, alongside `"vllm_c"` and `"native"`) — with
-zero changes to vLLM source.
-
-Everything here was measured on 4x NVIDIA A100-SXM4-40GB (driver 575.64.05,
-CUDA 12.9).
+A Mojo port of vLLM's `fused_add_rms_norm` CUDA kernel, registered into vLLM's
+IR-op dispatch system as a `"mojo"` provider (alongside `"vllm_c"` and
+`"native"`). No vLLM source changes required. Benchmarked on A100-SXM4-40GB.
 
 ## Results
 
-### Kernel-level: Mojo vs CUDA (same GPU, same shapes, in-place, hidden=3584, bf16)
+Kernel vs kernel, same GPU, in-place, `hidden=3584`, bf16, warm L2:
 
-| tokens | CUDA (`vllm_c`, graph replay) | Mojo (standalone) | delta |
-|-------:|------------------------------:|------------------:|------:|
-|    512 |                        7.67 µs |            8.55 µs |  +11% |
-|   2048 |                       31.56 µs |           32.81 µs |   +4% |
-|   4096 |                       91.65 µs |           93.04 µs | +1.5% |
+| tokens | CUDA | Mojo  |
+|-------:|-----:|------:|
+|    512 | 7.67 µs | 8.55 µs |
+|   2048 | 31.56 µs | 32.81 µs |
+|   4096 | 91.65 µs | 93.04 µs |
 
-A first-pass Mojo port reaches parity with the heavily-tuned CUDA kernel
-(warm-L2 conditions; see caveats below).
+Parity within 1.5-11% on a first port. The CUDA kernel also degrades badly at
+some hidden sizes where Mojo doesn't: at 16384 tokens, `hidden=7168` runs
+4972 µs (CUDA) vs 1384 µs (Mojo), and `hidden=16384` runs 8949 µs vs 3476 µs.
 
-### Where the CUDA kernel breaks, Mojo wins
+## The catch
 
-Under vLLM's own IR-op benchmark (eager, L2-flushed), the CUDA kernel falls
-off a cliff at some hidden sizes while the Mojo kernel scales smoothly:
+The kernel is fine; the bridge isn't. Through vLLM's eager dispatch the Mojo
+op pays ~85-190 µs per call (dlpack conversion per tensor + MAX engine
+dispatch + cross-stream syncs) vs ~8 µs for `torch.ops._C.*`, so a ~4 µs
+kernel is irrelevant below ~1000 tokens. MAX ops also cannot join torch
+CUDA-graph capture — they execute on MAX's internal stream.
 
-| shape (bf16)        | `vllm_c`  | `mojo`   | speedup |
-|---------------------|----------:|---------:|--------:|
-| 16384 tokens x 7168 | 4,972 µs | 1,384 µs |   3.6x  |
-| 16384 x 16384       | 8,949 µs | 3,476 µs |   2.6x  |
+Takeaway: Mojo kernels are competitive and the IR-op provider seam is clean,
+but per-op injection into eager vLLM negates the wins. The dispatch cost only
+amortizes when the whole model runs under MAX's graph runtime (`max serve`).
 
-### The integration cost (the real finding)
+## Files
 
-Through vLLM's eager dispatch, the Mojo op pays a **~85-190 µs fixed
-per-call bridge cost** (dlpack marshalling per tensor + MAX engine
-dispatch + cross-stream syncs) vs ~8 µs for `torch.ops._C.*`. At small
-batch sizes this overhead dominates the ~4 µs kernel entirely. MAX custom
-ops also cannot participate in torch CUDA-graph capture (they execute on
-MAX's internal stream).
+- `operations/fused_add_rms_norm.mojo` — kernel + custom op
+- `bench.py` — correctness vs fp32 reference (torch path)
+- `bench_kernel.mojo` — standalone kernel benchmark, no torch dispatch
+- `vllm_mojo_provider.py` — vLLM IR-op provider registration
+- `run_ir_bench_mojo.py` — correctness vs native/vllm_c + vLLM's IR bench
 
-**Conclusion:** Mojo kernels are competitive at the kernel level and slot
-into vLLM's IR-op provider registry cleanly, but per-op injection through
-torch dispatch negates the kernel wins. Mojo kernels pay off when the
-whole graph executes under MAX's runtime (`max serve`), where dispatch is
-amortized across the model and kernels fuse — which is precisely MAX's
-architecture thesis.
+## Gaps vs the CUDA kernel
 
-## What's in here
-
-| File | Purpose |
-|------|---------|
-| `operations/fused_add_rms_norm.mojo` | The Mojo kernel + `@extensibility.register` custom op (DPS signature; call-site aliasing gives in-place semantics) |
-| `bench.py` | Torch-side correctness harness vs an fp32 reference |
-| `bench_kernel.mojo` | Standalone Mojo kernel benchmark (no torch dispatch), incl. out-of-place / in-place / smem-row-cache variants |
-| `vllm_mojo_provider.py` | Registers the Mojo kernel as a vLLM IR-op provider (`"mojo"`) |
-| `run_ir_bench_mojo.py` | Correctness check vs native/vllm_c + runs vLLM's official `bench_ir_ops.py` with the Mojo provider |
-
-## Known kernel gaps vs the CUDA original
-
-The core math and in-place semantics match `csrc/libtorch_stable/layernorm_kernels.cu`,
-but this port is a specialization. It lacks: strided-row support (contiguous
-2D only), rank > 2 flattening, `weight=None`, the scalar fallback for
-unaligned/odd hidden sizes, fp16/fp32 correctness verification (bf16 only),
-and the batch-invariant mode. See the provider's `supports_args` for what is
-guarded; the rest is future work.
+Contiguous 2D inputs only (no strided rows, no rank > 2 flattening), no
+`weight=None`, no scalar fallback for unaligned or odd hidden sizes, bf16
+verified only, no batch-invariant mode.
 
 ## Setup
 
 ```bash
-# Environment with MAX nightly + torch (cu129 build for driver < 580)
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python max \
-    "torch==2.13.0+cu129" \
+uv pip install --python .venv/bin/python max "torch==2.13.0+cu129" \
     --extra-index-url https://whl.modular.com/nightly/simple/ \
     --index-url https://download.pytorch.org/whl/cu129
 ```
 
-On RHEL hosts with an old system libstdc++, point `LD_LIBRARY_PATH` at a
-newer copy (e.g. from nsight-systems). On machines with driver < 580
-(CUDA 13), point `MODULAR_NVPTX_COMPILER_PATH` at a CUDA 12 `ptxas` (torch
-wheels bundle one under `nvidia/cuda_nvcc/bin/ptxas`).
+On RHEL with old system libstdc++, point `LD_LIBRARY_PATH` at a newer copy.
+On driver < 580 (CUDA 13), set `MODULAR_NVPTX_COMPILER_PATH` to a CUDA 12
+`ptxas` (torch bundles one under `nvidia/cuda_nvcc/bin/ptxas`).
 
 ```bash
-# 1. Correctness through the torch dispatch path
-python bench.py
-
-# 2. Standalone kernel benchmark (the pure Mojo-vs-CUDA numbers)
-.venv/bin/mojo bench_kernel.mojo -I .
-
-# 3. Full vLLM IR-op integration: correctness + official benchmark
-VLLM_ROOT=/path/to/vllm python run_ir_bench_mojo.py
+python bench.py                        # correctness
+.venv/bin/mojo bench_kernel.mojo -I .  # kernel benchmark
+VLLM_ROOT=/path/to/vllm python run_ir_bench_mojo.py   # vLLM integration
 ```
 
-For (3), the vLLM venv additionally needs `max` installed
-(`uv pip install max --extra-index-url https://whl.modular.com/nightly/simple/`).
+The vLLM checkout for the last command needs `max` installed in its venv.
 
 ## License
 
-Apache-2.0 (the kernel structure follows Apache-2.0 licensed code from
-vLLM's `layernorm_kernels.cu` and Modular's custom-op examples).
+Apache-2.0
