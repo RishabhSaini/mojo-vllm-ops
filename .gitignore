@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.mojoc
+*.pyc
+*.pt
+*.json
+nohup.out
